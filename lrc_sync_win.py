@@ -41,10 +41,12 @@ SAMPLE_SONGS = [
 
 
 def format_lrc_time(seconds):
-    seconds = max(0.0, float(seconds))
-    mins = int(seconds // 60)
-    secs = seconds % 60
-    return f"{mins:02d}:{secs:05.2f}"
+    total_centis = max(0, int(round(float(seconds) * 100)))
+    mins = total_centis // 6000
+    total_centis %= 6000
+    secs = total_centis // 100
+    centis = total_centis % 100
+    return f"{mins:02d}:{secs:02d}.{centis:02d}"
 
 
 def split_lyrics_into_lines(raw_text):
