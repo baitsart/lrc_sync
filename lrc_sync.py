@@ -34,10 +34,12 @@ SAMPLE_SONGS = [
 
 
 def format_lrc_time(seconds):
-    seconds = max(0.0, float(seconds))
-    mins = int(seconds // 60)
-    secs = seconds % 60
-    return f"{mins:02d}:{secs:05.2f}"
+    total_centis = max(0, int(round(float(seconds) * 100)))
+    mins = total_centis // 6000
+    total_centis %= 6000
+    secs = total_centis // 100
+    centis = total_centis % 100
+    return f"{mins:02d}:{secs:02d}.{centis:02d}"
 
 
 def split_lyrics_into_lines(raw_text):
@@ -596,16 +598,28 @@ class LrcSyncWindow(Gtk.Window):
             action=Gtk.FileChooserAction.SAVE,
         )
         fc.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        fc.set_do_overwrite_confirmation(True)
         fc.set_current_folder(target_dir)
         fc.set_current_name(os.path.basename(default_path))
 
-        if fc.run() == Gtk.ResponseType.OK:
-            with open(fc.get_filename(), "w", encoding="utf-8") as f:
+        response = None
+        out_path = None
+        try:
+            response = fc.run()
+            if response == Gtk.ResponseType.OK:
+                out_path = fc.get_filename()
+        finally:
+            fc.destroy()
+
+        if response == Gtk.ResponseType.OK and out_path:
+            if not out_path.lower().endswith(".lrc"):
+                out_path += ".lrc"
+            with open(out_path, "w", encoding="utf-8") as f:
                 if self.current_yt_url:
                     f.write(f"#Link a youtube: {self.current_yt_url}\n")
                 for row in self.done_store:
                     f.write(f"{row[1]}{row[2]}\n")
-            self.set_status(f"Guardado: {fc.get_filename()}")
+            self.set_status(f"Guardado: {out_path}")
 
 
 if __name__ == "__main__":
