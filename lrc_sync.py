@@ -289,8 +289,8 @@ MANIFEST_JSON = json.dumps({
     ]
 }, ensure_ascii=False)
 
-ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <rect width="128" height="128" rx="24" fill="#1f4e78"/>
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160">
+  <rect width="160" height="160" rx="24" fill="#1f4e78"/>
   <circle cx="64" cy="64" r="36" fill="none" stroke="#8ce99a" stroke-width="8"/>
   <polygon points="56,46 84,64 56,82" fill="#eef1f4"/>
 </svg>"""
