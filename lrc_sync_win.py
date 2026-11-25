@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import glob
 import json
 import os
 import re
@@ -140,7 +141,8 @@ class LrcSyncWinApp:
         self.selected_done_index = None
 
         self.pending_lines = []
-        self.done_rows = []  # lista de dicts: {"seconds": float, "stamp": str, "text": str}
+        self.active_pending_index = 0
+        self.done_rows = []  # lista de dicts: {"seconds": float, "stamp": str, "text": str, "orig_index": int | None}
 
         self._build_ui()
         self._bind_events()
@@ -162,7 +164,7 @@ class LrcSyncWinApp:
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Fila superior: selector de canción y carga de JSON / TXT
+        # Fila superior: selector de canción y carga de JSON / Edición / TXT
         song_bar = ttk.Frame(main_frame)
         song_bar.pack(fill=tk.X, pady=(0, 8))
 
@@ -173,6 +175,9 @@ class LrcSyncWinApp:
         self.populate_song_combo()
 
         ttk.Button(song_bar, text="Cargar gifts_album_yt.json", command=self.on_load_json).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(song_bar, text="Editar entrada", command=self.on_edit_entry).pack(
             side=tk.LEFT, padx=(0, 6)
         )
         ttk.Button(song_bar, text="Pegar / Abrir .txt", command=self.on_load_dialog).pack(side=tk.RIGHT)
@@ -262,6 +267,7 @@ class LrcSyncWinApp:
 
     def _bind_events(self):
         self.song_combo.bind("<<ComboboxSelected>>", self.on_song_changed)
+        self.pending_listbox.bind("<<ListboxSelect>>", self.on_pending_selection_changed)
         self.done_tree.bind("<<TreeviewSelect>>", self.on_done_selection_changed)
 
         self.time_lbl.bind("<ButtonPress-1>", self.on_time_press)
@@ -289,19 +295,46 @@ class LrcSyncWinApp:
 
     def find_auto_json(self):
         home = os.path.expanduser("~")
-        candidates = [
-            os.path.join(os.getcwd(), "gifts_album_yt.json"),
-            os.path.join(home, "gifts_album_yt.json"),
-            os.path.join(home, "Downloads", "gifts_album_yt.json"),
-            os.path.join(home, "Descargas", "gifts_album_yt.json"),
-            os.path.join(os.getcwd(), "gifts_album.json"),
-            os.path.join(home, "Downloads", "gifts_album.json"),
-            os.path.join(home, "Descargas", "gifts_album.json"),
-            os.path.join(home, "gifts_album.json"),
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        exe_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else script_dir
+        meipass_dir = getattr(sys, "_MEIPASS", None)
+
+        search_dirs = [
+            os.getcwd(),
+            exe_dir,
+            script_dir,
+            home,
+            os.path.join(home, "Downloads"),
+            os.path.join(home, "Descargas"),
+            os.path.join(home, "Music"),
+            os.path.join(home, "Música"),
         ]
-        for c in candidates:
-            if os.path.isfile(c):
-                return c
+        if meipass_dir:
+            search_dirs.append(meipass_dir)
+
+        exact_names = ("gifts_album_yt.json", "gifts_album.json")
+        seen = set()
+        for d in search_dirs:
+            norm = os.path.abspath(d)
+            if norm in seen or not os.path.isdir(norm):
+                continue
+            seen.add(norm)
+            for name in exact_names:
+                c = os.path.join(norm, name)
+                if os.path.isfile(c):
+                    return c
+
+        for d in seen:
+            for pattern in ("*gifts*.json", "*.json"):
+                for path in sorted(glob.glob(os.path.join(d, pattern))):
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                            if "title" in data[0] and ("audio" in data[0] or "lyrics" in data[0]):
+                                return path
+                    except Exception:
+                        continue
         return None
 
     def load_json_file(self, path):
@@ -418,6 +451,7 @@ class LrcSyncWinApp:
 
     def load_lyrics_text(self, text, title_text=""):
         self.pending_lines = split_lyrics_into_lines(text)
+        self.active_pending_index = 0
         self.done_rows = []
         self.selected_done_index = None
 
@@ -427,17 +461,36 @@ class LrcSyncWinApp:
                 "seconds": 1.00,
                 "stamp": "[00:01:00]",
                 "text": f"Título de la canción: {clean_title}",
+                "orig_index": None,
             })
 
-        self._refresh_pending_listbox()
+        self._refresh_pending_listbox(select_idx=0)
         self._refresh_done_tree()
-        self.select_first_pending()
 
-    def _refresh_pending_listbox(self):
+    def _refresh_pending_listbox(self, select_idx=None):
         self.pending_listbox.delete(0, tk.END)
         for line in self.pending_lines:
             self.pending_listbox.insert(tk.END, line)
-        self.pending_var.set(f"Pendientes ({len(self.pending_lines)} líneas — primera seleccionada)")
+        self.pending_var.set(f"Pendientes ({len(self.pending_lines)} líneas)")
+
+        if len(self.pending_lines) == 0:
+            self.active_pending_index = 0
+            return
+
+        if select_idx is not None:
+            self.active_pending_index = max(0, min(select_idx, len(self.pending_lines) - 1))
+        else:
+            self.active_pending_index = max(0, min(self.active_pending_index, len(self.pending_lines) - 1))
+
+        self.pending_listbox.selection_clear(0, tk.END)
+        self.pending_listbox.selection_set(self.active_pending_index)
+        self.pending_listbox.activate(self.active_pending_index)
+        self.pending_listbox.see(self.active_pending_index)
+
+    def on_pending_selection_changed(self, _event=None):
+        sel = self.pending_listbox.curselection()
+        if sel:
+            self.active_pending_index = sel[0]
 
     def _refresh_done_tree(self, select_idx=None):
         for item in self.done_tree.get_children():
@@ -453,11 +506,59 @@ class LrcSyncWinApp:
             self.selected_done_index = select_idx
 
     def select_first_pending(self):
-        if len(self.pending_lines) > 0:
-            self.pending_listbox.selection_clear(0, tk.END)
-            self.pending_listbox.selection_set(0)
-            self.pending_listbox.activate(0)
-            self.pending_listbox.see(0)
+        self._refresh_pending_listbox(select_idx=0)
+
+    def get_full_entry_text(self):
+        done_with_pos = [
+            r for r in self.done_rows if r.get("orig_index") is not None
+        ]
+        if done_with_pos:
+            done_map = {r["orig_index"]: r["text"] for r in done_with_pos}
+            total = max(max(done_map.keys()) + 1, len(done_map) + len(self.pending_lines))
+            merged = []
+            p_iter = iter(self.pending_lines)
+            for i in range(total):
+                if i in done_map:
+                    merged.append(done_map[i])
+                else:
+                    nxt = next(p_iter, None)
+                    if nxt is not None:
+                        merged.append(nxt)
+            merged.extend(p_iter)
+            return "\n".join(merged)
+        return "\n".join(self.pending_lines)
+
+    def on_edit_entry(self):
+        dlg = tk.Toplevel(self.root)
+        song_title = (self.current_song or {}).get("title") or "Entrada"
+        dlg.title(f"Editar entrada — {song_title}")
+        dlg.geometry("640x440")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Edita toda la letra de esta entrada (una línea por frase):").pack(
+            anchor=tk.W, padx=10, pady=(10, 4)
+        )
+
+        txt_widget = tk.Text(dlg, wrap=tk.WORD)
+        txt_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        txt_widget.insert("1.0", self.get_full_entry_text())
+        txt_widget.focus_set()
+
+        btn_frame = ttk.Frame(dlg)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def apply_edit():
+            raw = txt_widget.get("1.0", tk.END).strip()
+            if self.current_song is not None:
+                self.current_song["lyrics"] = raw
+            title = (self.current_song or {}).get("title", "")
+            self.load_lyrics_text(raw, title_text=title)
+            self.set_status("Entrada completa actualizada.")
+            dlg.destroy()
+
+        ttk.Button(btn_frame, text="Cancelar", command=dlg.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btn_frame, text="Guardar entrada", command=apply_edit).pack(side=tk.RIGHT)
 
     def poll_player_time(self):
         if self.drag_start_x is None and self.is_playing and not self.is_paused:
@@ -508,7 +609,8 @@ class LrcSyncWinApp:
         if not self.pending_lines:
             return
         sel = self.pending_listbox.curselection()
-        idx = sel[0] if sel else 0
+        idx = sel[0] if sel else self.active_pending_index
+        idx = max(0, min(idx, len(self.pending_lines) - 1))
         line_text = self.pending_lines.pop(idx)
 
         ts = self.current_time
@@ -516,12 +618,12 @@ class LrcSyncWinApp:
             "seconds": ts,
             "stamp": f"[{format_lrc_time(ts)}]",
             "text": line_text,
+            "orig_index": idx,
         })
 
         new_done_idx = len(self.done_rows) - 1
-        self._refresh_pending_listbox()
+        self._refresh_pending_listbox(select_idx=idx)
         self._refresh_done_tree(select_idx=new_done_idx)
-        self.select_first_pending()
 
     def on_done_selection_changed(self, _event=None):
         sel = self.done_tree.selection()
@@ -589,10 +691,14 @@ class LrcSyncWinApp:
         if not self.done_rows:
             return
         last = self.done_rows.pop()
-        self.pending_lines.insert(0, last["text"])
-        self._refresh_pending_listbox()
+        orig_idx = last.get("orig_index")
+        if orig_idx is not None:
+            insert_pos = max(0, min(orig_idx, len(self.pending_lines)))
+        else:
+            insert_pos = 0
+        self.pending_lines.insert(insert_pos, last["text"])
+        self._refresh_pending_listbox(select_idx=insert_pos)
         self._refresh_done_tree(select_idx=len(self.done_rows) - 1 if self.done_rows else None)
-        self.select_first_pending()
 
     def on_load_dialog(self):
         dlg = tk.Toplevel(self.root)
