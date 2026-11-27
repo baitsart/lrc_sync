@@ -136,6 +136,7 @@ class LrcSyncWinApp:
         self.is_paused = False
         self.current_time = 0.0
         self.last_tick_mono = None
+        self.seek_cooldown_until = 0.0
         self.drag_start_x = None
         self.drag_start_time = 0.0
         self.selected_done_index = None
@@ -164,7 +165,6 @@ class LrcSyncWinApp:
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Fila superior: selector de canción y carga de JSON / Edición / TXT
         song_bar = ttk.Frame(main_frame)
         song_bar.pack(fill=tk.X, pady=(0, 8))
 
@@ -182,11 +182,10 @@ class LrcSyncWinApp:
         )
         ttk.Button(song_bar, text="Pegar / Abrir .txt", command=self.on_load_dialog).pack(side=tk.RIGHT)
 
-        # Barra de reproducción, reloj y ajustes de tiempo
         top_bar = ttk.Frame(main_frame)
         top_bar.pack(fill=tk.X, pady=(0, 8))
 
-        self.btn_play = ttk.Button(top_bar, text="▶ Reproducir / Pausa", command=self.on_play_pause)
+        self.btn_play = ttk.Button(top_bar, text="▶ Reproducir / Pausa", command=self.on_play_pause, takefocus=False)
         self.btn_play.pack(side=tk.LEFT, padx=(0, 8))
 
         self.time_var = tk.StringVar(value="00:00.00")
@@ -194,19 +193,28 @@ class LrcSyncWinApp:
             top_bar,
             textvariable=self.time_var,
             font=("Consolas", 18, "bold"),
-            padx=10,
+            width=10,
+            anchor="center",
+            padx=8,
             pady=2,
             relief=tk.GROOVE,
             cursor="sb_h_double_arrow",
         )
         self.time_lbl.pack(side=tk.LEFT, padx=(0, 10))
 
-        ttk.Button(top_bar, text="⏪ -0.50s", command=lambda: self.adjust_time(-0.50)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top_bar, text="◀ -0.10s", command=lambda: self.adjust_time(-0.10)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top_bar, text="+0.10s ▶", command=lambda: self.adjust_time(0.10)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(top_bar, text="+0.50s ⏩", command=lambda: self.adjust_time(0.50)).pack(side=tk.LEFT, padx=2)
+        for label, delta in (
+            ("⏪ -0.50s", -0.50),
+            ("◀ -0.10s", -0.10),
+            ("+0.10s ▶", 0.10),
+            ("+0.50s ⏩", 0.50),
+        ):
+            ttk.Button(
+                top_bar,
+                text=label,
+                takefocus=False,
+                command=lambda d=delta: self.adjust_time(d),
+            ).pack(side=tk.LEFT, padx=2)
 
-        # Panel central dividido: Pendientes vs Ya hecho
         paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
@@ -247,20 +255,25 @@ class LrcSyncWinApp:
         scroll_right.pack(side=tk.RIGHT, fill=tk.Y)
         paned.add(right_frame, weight=1)
 
-        # Barra inferior de acciones
         bottom_bar = ttk.Frame(main_frame)
         bottom_bar.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Button(
             bottom_bar,
             text="⏱ Presiona cuando oigas la frase (Enter)",
+            takefocus=False,
             command=self.on_stamp_line,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
-        ttk.Button(bottom_bar, text="↩ Devolver última a pendientes", command=self.on_undo_last).pack(
-            side=tk.LEFT, padx=(0, 6)
+        ttk.Button(
+            bottom_bar,
+            text="↩ Devolver última a pendientes",
+            takefocus=False,
+            command=self.on_undo_last,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(bottom_bar, text="💾 Guardar .lrc", takefocus=False, command=self.on_save_lrc).pack(
+            side=tk.LEFT
         )
-        ttk.Button(bottom_bar, text="💾 Guardar .lrc", command=self.on_save_lrc).pack(side=tk.LEFT)
 
         self.status_var = tk.StringVar(value="Listo.")
         ttk.Label(main_frame, textvariable=self.status_var, anchor=tk.W).pack(fill=tk.X)
@@ -372,6 +385,7 @@ class LrcSyncWinApp:
         self.stop_mpv()
         self.current_time = 0.0
         self.last_tick_mono = None
+        self.seek_cooldown_until = 0.0
         self.update_time_display()
 
         title = (self.current_song.get("title") or "").strip()
@@ -396,6 +410,7 @@ class LrcSyncWinApp:
             self.mpv_exe,
             "--no-video",
             "--cache=yes",
+            "--hr-seek=yes",
             f"--http-header-fields={REFERER_HEADER}",
             "--really-quiet",
         ]
@@ -561,6 +576,7 @@ class LrcSyncWinApp:
         ttk.Button(btn_frame, text="Guardar entrada", command=apply_edit).pack(side=tk.RIGHT)
 
     def poll_player_time(self):
+        now = time.monotonic()
         if self.drag_start_x is None and self.is_playing and not self.is_paused:
             if self.mpv_proc is not None and self.mpv_proc.poll() is not None:
                 rc = self.mpv_proc.returncode
@@ -569,13 +585,12 @@ class LrcSyncWinApp:
                 self.last_tick_mono = None
                 self.btn_play.configure(text="▶ Reproducir / Pausa")
                 self.set_status("Reproducción finalizada." if rc == 0 else f"⚠️ mpv se detuvo (código {rc}).")
-            else:
+            elif now >= self.seek_cooldown_until:
                 pos = mpv_pipe_cmd(["get_property", "time-pos"]) if HAS_WIN32 else None
                 if isinstance(pos, (int, float)):
                     self.current_time = float(pos)
-                    self.last_tick_mono = time.monotonic()
+                    self.last_tick_mono = now
                 else:
-                    now = time.monotonic()
                     if self.last_tick_mono is not None:
                         self.current_time += max(0.0, now - self.last_tick_mono)
                     self.last_tick_mono = now
@@ -636,6 +651,15 @@ class LrcSyncWinApp:
             self.selected_done_index = None
 
     def adjust_time(self, delta):
+        self.current_time = max(0.0, self.current_time + delta)
+        self.last_tick_mono = time.monotonic()
+        self.seek_cooldown_until = self.last_tick_mono + 0.35
+        self.update_time_display()
+
+        if self.is_playing and self.mpv_proc is not None and self.mpv_proc.poll() is None:
+            if HAS_WIN32:
+                mpv_pipe_cmd(["seek", f"{self.current_time:.2f}", "absolute", "exact"])
+
         if self.selected_done_index is not None and 0 <= self.selected_done_index < len(self.done_rows):
             row = self.done_rows[self.selected_done_index]
             new_ts = max(0.0, row["seconds"] + delta)
@@ -643,49 +667,34 @@ class LrcSyncWinApp:
             row["stamp"] = f"[{format_lrc_time(new_ts)}]"
             idx = self.selected_done_index
             self._refresh_done_tree(select_idx=idx)
-            self.set_status(f"Ajustada línea {idx + 1} a {row['stamp']}")
+            self.set_status(
+                f"Tiempo: {format_lrc_time(self.current_time)} | Línea {idx + 1}: {row['stamp']}"
+            )
         else:
-            self.current_time = max(0.0, self.current_time + delta)
-            self.last_tick_mono = time.monotonic()
-            self.update_time_display()
-            if self.is_playing and self.mpv_proc is not None and self.mpv_proc.poll() is None:
-                if HAS_WIN32:
-                    mpv_pipe_cmd(["seek", f"{self.current_time:.2f}", "absolute"])
-                else:
-                    self.start_current_song_audio(start_at=self.current_time)
+            self.set_status(f"Tiempo actual: {format_lrc_time(self.current_time)}")
 
     def on_time_press(self, event):
         self.drag_start_x = event.x
-        if self.selected_done_index is not None and 0 <= self.selected_done_index < len(self.done_rows):
-            self.drag_start_time = self.done_rows[self.selected_done_index]["seconds"]
-        else:
-            self.drag_start_time = self.current_time
+        self.drag_start_time = self.current_time
 
     def on_time_drag(self, event):
         if self.drag_start_x is None:
             return
         dx = event.x - self.drag_start_x
         delta = (dx / 10.0) * 0.05
-        new_t = max(0.0, self.drag_start_time + delta)
-        if self.selected_done_index is not None and 0 <= self.selected_done_index < len(self.done_rows):
-            row = self.done_rows[self.selected_done_index]
-            row["seconds"] = new_t
-            row["stamp"] = f"[{format_lrc_time(new_t)}]"
-            self._refresh_done_tree(select_idx=self.selected_done_index)
-        else:
-            self.current_time = new_t
-            self.update_time_display()
+        self.current_time = max(0.0, self.drag_start_time + delta)
+        self.update_time_display()
 
     def on_time_release(self, _event):
         if self.drag_start_x is None:
             return
         self.drag_start_x = None
-        self.last_tick_mono = time.monotonic()
-        if self.selected_done_index is None and self.is_playing and self.mpv_proc and self.mpv_proc.poll() is None:
+        now = time.monotonic()
+        self.last_tick_mono = now
+        if self.is_playing and self.mpv_proc and self.mpv_proc.poll() is None:
             if HAS_WIN32:
-                mpv_pipe_cmd(["seek", f"{self.current_time:.2f}", "absolute"])
-            else:
-                self.start_current_song_audio(start_at=self.current_time)
+                self.seek_cooldown_until = now + 0.35
+                mpv_pipe_cmd(["seek", f"{self.current_time:.2f}", "absolute", "exact"])
 
     def on_undo_last(self):
         if not self.done_rows:
