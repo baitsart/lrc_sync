@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import gi
 
 gi.require_version("Gtk", "3.0")
@@ -109,6 +110,7 @@ class LrcSyncWindow(Gtk.Window):
         self.drag_start_x = None
         self.drag_start_time = 0.0
         self.selected_done_index = None
+        self.seek_cooldown_until = 0.0
 
         # Guardamos el índice original de cada línea estampada para poder devolverla a su sitio
         # Estructura por fila: (ts_float, tag_str, phrase_str, orig_idx_int_or_None)
@@ -148,11 +150,15 @@ class LrcSyncWindow(Gtk.Window):
         top_bar.pack_start(self.btn_play, False, False, 0)
 
         self.time_event_box = Gtk.EventBox()
-        self.time_event_box.set_can_focus(True)
+        self.time_event_box.set_can_focus(False)
+        self.time_event_box.set_size_request(165, 36)
         self.time_event_box.set_tooltip_text(
             "Arrastra horizontalmente con el mouse o usa flechas ← / → para mover el tiempo"
         )
         self.time_label = Gtk.Label()
+        self.time_label.set_width_chars(10)
+        self.time_label.set_xalign(0.5)
+        self.time_label.set_yalign(0.5)
         self.time_label.set_markup(
             "<span size='x-large' weight='bold' font_family='monospace'>00:00.00</span>"
         )
@@ -162,29 +168,22 @@ class LrcSyncWindow(Gtk.Window):
             Gdk.EventMask.BUTTON_PRESS_MASK
             | Gdk.EventMask.BUTTON_RELEASE_MASK
             | Gdk.EventMask.POINTER_MOTION_MASK
-            | Gdk.EventMask.KEY_PRESS_MASK
         )
         self.time_event_box.connect("button-press-event", self.on_time_press)
         self.time_event_box.connect("motion-notify-event", self.on_time_drag)
         self.time_event_box.connect("button-release-event", self.on_time_release)
-        self.time_event_box.connect("key-press-event", self.on_time_key)
         top_bar.pack_start(self.time_event_box, False, False, 8)
 
-        btn_early_big = Gtk.Button(label="⏪ -0.50s")
-        btn_early_big.connect("clicked", lambda *_: self.adjust_time(-0.50))
-        top_bar.pack_start(btn_early_big, False, False, 0)
-
-        btn_early = Gtk.Button(label="◀ -0.10s")
-        btn_early.connect("clicked", lambda *_: self.adjust_time(-0.10))
-        top_bar.pack_start(btn_early, False, False, 0)
-
-        btn_late = Gtk.Button(label="+0.10s ▶")
-        btn_late.connect("clicked", lambda *_: self.adjust_time(0.10))
-        top_bar.pack_start(btn_late, False, False, 0)
-
-        btn_late_big = Gtk.Button(label="+0.50s ⏩")
-        btn_late_big.connect("clicked", lambda *_: self.adjust_time(0.50))
-        top_bar.pack_start(btn_late_big, False, False, 0)
+        for label, delta in (
+            ("⏪ -0.50s", -0.50),
+            ("◀ -0.10s", -0.10),
+            ("+0.10s ▶", 0.10),
+            ("+0.50s ⏩", 0.50),
+        ):
+            btn = Gtk.Button(label=label)
+            btn.set_can_focus(False)
+            btn.connect("clicked", lambda _, d=delta: self.adjust_time(d))
+            top_bar.pack_start(btn, False, False, 0)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         main_vbox.pack_start(paned, True, True, 0)
@@ -329,6 +328,7 @@ class LrcSyncWindow(Gtk.Window):
         self.current_yt_url = extract_youtube_url(self.current_song)
         self.stop_mpv()
         self.current_time = 0.0
+        self.seek_cooldown_until = 0.0
         self.is_paused = False
         self.update_time_display()
         title = (self.current_song.get("title") or "").strip()
@@ -360,6 +360,7 @@ class LrcSyncWindow(Gtk.Window):
                     "mpv",
                     "--no-video",
                     "--cache=yes",
+                    "--hr-seek=yes",
                     f"--http-header-fields={REFERER_HEADER}",
                     "--really-quiet",
                     f"--input-ipc-server={IPC_SOCKET}",
@@ -444,7 +445,6 @@ class LrcSyncWindow(Gtk.Window):
                 collected.append((orig, row[2]))
         pending_lines = [row[0] for row in self.pending_store]
 
-        # Si hay índices originales, ordenamos las ya estampadas según su orden original y mezclamos
         if collected:
             done_map = {orig: phrase for orig, phrase in collected}
             total_slots = max(max(done_map.keys()) + 1, len(done_map) + len(pending_lines))
@@ -503,6 +503,9 @@ class LrcSyncWindow(Gtk.Window):
 
     def poll_player_time(self):
         if self.drag_start_x is not None:
+            return True
+
+        if time.monotonic() < self.seek_cooldown_until:
             return True
 
         if self.mpv_proc is not None:
@@ -569,47 +572,44 @@ class LrcSyncWindow(Gtk.Window):
             self.selected_done_index = None
 
     def adjust_time(self, delta):
+        self.current_time = max(0.0, self.current_time + delta)
+        self.seek_cooldown_until = time.monotonic() + 0.35
+        self.update_time_display()
+
+        if self.mpv_proc is not None and self.mpv_proc.poll() is None:
+            mpv_ipc(["seek", f"{self.current_time:.2f}", "absolute", "exact"])
+
         if self.selected_done_index is not None and 0 <= self.selected_done_index < len(self.done_store):
             row = self.done_store[self.selected_done_index]
             new_ts = max(0.0, row[0] + delta)
             row[0] = new_ts
             row[1] = f"[{format_lrc_time(new_ts)}]"
-            self.set_status(f"Ajustada línea {self.selected_done_index + 1} a {row[1]}")
+            self.set_status(
+                f"Tiempo: {format_lrc_time(self.current_time)} | Línea {self.selected_done_index + 1}: {row[1]}"
+            )
         else:
-            self.current_time = max(0.0, self.current_time + delta)
-            self.update_time_display()
-            if self.mpv_proc is not None and self.mpv_proc.poll() is None:
-                mpv_ipc(["seek", f"{self.current_time:.2f}", "absolute"])
+            self.set_status(f"Tiempo actual: {format_lrc_time(self.current_time)}")
 
     def on_time_press(self, widget, event):
-        widget.grab_focus()
         if event.button == 1:
             self.drag_start_x = event.x
-            if self.selected_done_index is not None and 0 <= self.selected_done_index < len(self.done_store):
-                self.drag_start_time = self.done_store[self.selected_done_index][0]
-            else:
-                self.drag_start_time = self.current_time
+            self.drag_start_time = self.current_time
         return True
 
     def on_time_drag(self, widget, event):
         if self.drag_start_x is not None:
             dx = event.x - self.drag_start_x
             delta = (dx / 10.0) * 0.05
-            new_t = max(0.0, self.drag_start_time + delta)
-            if self.selected_done_index is not None and 0 <= self.selected_done_index < len(self.done_store):
-                row = self.done_store[self.selected_done_index]
-                row[0] = new_t
-                row[1] = f"[{format_lrc_time(new_t)}]"
-            else:
-                self.current_time = new_t
-                self.update_time_display()
+            self.current_time = max(0.0, self.drag_start_time + delta)
+            self.update_time_display()
         return True
 
     def on_time_release(self, widget, event):
         if self.drag_start_x is not None:
             self.drag_start_x = None
-            if self.selected_done_index is None and self.mpv_proc is not None and self.mpv_proc.poll() is None:
-                mpv_ipc(["seek", f"{self.current_time:.2f}", "absolute"])
+            if self.mpv_proc is not None and self.mpv_proc.poll() is None:
+                self.seek_cooldown_until = time.monotonic() + 0.35
+                mpv_ipc(["seek", f"{self.current_time:.2f}", "absolute", "exact"])
         return True
 
     def on_time_key(self, widget, event):
